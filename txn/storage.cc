@@ -12,10 +12,13 @@ bool Storage::Read(Key key, Value* result, int txn_unique_id) {
   }
 }
 
+uint64 *Storage::GetTID(Key key) {
+  return &((data_[key]).tid);
+}
+
 // Write value and timestamps
 void Storage::Write(Key key, Value value, int txn_unique_id) {
   data_[key] = value;
-  timestamps_[key] = GetTime();
 }
 
 double Storage::Timestamp(Key key) {
@@ -27,6 +30,7 @@ double Storage::Timestamp(Key key) {
 // Init the storage
 void Storage::InitStorage() {
   for (int i = 0; i < 1000000;i++) {
-    Write(i, 0, 0);
+    Value val = {0, 0};
+    Write(i, val, 0);
   } 
 }

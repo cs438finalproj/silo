@@ -79,8 +79,8 @@ void Benchmark(const vector<LoadGen*>& lg) {
   deque<Txn*> doneTxns;
 
   // For each MODE...
-  for (CCMode mode = SERIAL;
-      mode <= MVCC;
+  for (CCMode mode = OCC;
+      mode <= OCC;
       mode = static_cast<CCMode>(mode+1)) {
     // Print out mode name.
     cout << ModeToString(mode) << flush;
@@ -111,7 +111,10 @@ void Benchmark(const vector<LoadGen*>& lg) {
         }
 
         // Wait for all of them to finish.
-        for (int i = 0; i < active_txns; i++) {
+        for (int i = 0; i < (active_txns - 50); i++) {
+
+        printf("Waiting for txn %d to finish\n", i);
+
           Txn* txn = p->GetTxnResult();
           doneTxns.push_back(txn);
           txn_count++;

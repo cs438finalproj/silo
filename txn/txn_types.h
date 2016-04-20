@@ -41,7 +41,7 @@ class Expect : public Txn {
   virtual void Run() {
     Value result;
     for (map<Key, Value>::iterator it = m_.begin(); it != m_.end(); ++it) {
-      if (!Read(it->first, &result) || result != it->second) {
+      if (!Read(it->first, &result) || result.val != (it->second).val) {
         ABORT;
       }
     }
@@ -123,15 +123,17 @@ class RMW : public Txn {
   virtual void Run() {
     Value result;
     // Read everything in readset.
-    for (set<Key>::iterator it = readset_.begin(); it != readset_.end(); ++it)
+    for (set<Key>::iterator it = readset_.begin(); it != readset_.end(); ++it) {
       Read(*it, &result);
+    }
 
     // Increment length of everything in writeset.
     for (set<Key>::iterator it = writeset_.begin(); it != writeset_.end();
          ++it) {
-      result = 0;
+      result.val = 0;
       Read(*it, &result);
-      Write(*it, result + 1);
+      result.val++;
+      Write(*it, result);
     }
 
     // Run while loop to simulate the txn logic(duration is time_).

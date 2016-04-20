@@ -8,6 +8,7 @@
 #include <deque>
 #include <map>
 #include <string>
+#include <atomic>
 
 #include "txn/common.h"
 #include "txn/lock_manager.h"
@@ -23,6 +24,7 @@
 using std::deque;
 using std::map;
 using std::string;
+using std::atomic_compare_exchange_strong;
 
 // The TxnProcessor supports five different execution modes, corresponding to
 // the four parts of assignment 2, plus a simple serial (non-concurrent) mode.
@@ -88,10 +90,22 @@ class TxnProcessor {
   // transaction logic.
   void ExecuteTxn(Txn* txn);
 
+  // Silo implementation
+  void RunSiloThread(Txn* txn);
+  bool isLocked(uint64 tid);
+  void abort(Txn *txn);
+  uint64 unlockTid(uint64 tid);
+  uint64 buildTidWord(uint64 tid, uint64 epoch);
+  void EpochManager();
+  void siloLock(uint64 *tid);
+
   // Applies all writes performed by '*txn' to 'storage_'.
   //
   // Requires: txn->Status() is COMPLETED_C.
   void ApplyWrites(Txn* txn);
+
+  // for Silo
+  void ApplyWrites(Txn* txn, uint64 tid);
   
   // The following functions are for MVCC
   void MVCCExecuteTxn(Txn* txn);
@@ -142,6 +156,9 @@ class TxnProcessor {
 
   // Lock Manager used for LOCKING concurrency implementations.
   LockManager* lm_;
+
+  // Global epoch number
+  uint64 E;
 };
 
 #endif  // _TXN_PROCESSOR_H_

@@ -6,11 +6,20 @@
 #include "txn/txn_processor.h"
 #include <stdio.h>
 #include <set>
+#include <thread>
 
 #include "txn/lock_manager.h"
 
-// Thread & queue counts for StaticThreadPool initialization.
-#define THREAD_COUNT 8
+// compiler/memory fence
+#include "txn/util.h"
+
+// Thread & queue counts for StaticThreadPool initialization. // TODO (change thread count)
+#define THREAD_COUNT (1 + 1)
+
+
+
+uint64 requests_in_system = 0;
+
 
 TxnProcessor::TxnProcessor(CCMode mode)
     : mode_(mode), tp_(THREAD_COUNT), next_unique_id_(1) {
@@ -43,6 +52,8 @@ TxnProcessor::TxnProcessor(CCMode mode)
   pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &cpuset);
   pthread_t scheduler_;
   pthread_create(&scheduler_, &attr, StartScheduler, reinterpret_cast<void*>(this));
+
+  E = 0;
   
 }
 
@@ -75,6 +86,10 @@ Txn* TxnProcessor::GetTxnResult() {
     // atomic queues).
     sleep(0.000001);
   }
+
+  std::cout << "thread " << std::this_thread::get_id() << ": " << std::flush;
+  printf("found a result!\n");
+
   return txn;
 }
 
@@ -222,6 +237,43 @@ void TxnProcessor::RunLockingScheduler() {
   }
 }
 
+void TxnProcessor::ApplyWrites(Txn* txn) {
+  // Write buffered writes out to storage.
+  for (map<Key, Value>::iterator it = txn->writes_.begin();
+       it != txn->writes_.end(); ++it) {
+    storage_->Write(it->first, it->second, txn->unique_id_);
+  }
+}
+
+
+
+void TxnProcessor::RunOCCParallelScheduler() {
+  // CPSC 438/538:
+  //
+  // Implement this method! Note that implementing OCC with parallel
+  // validation may need to create another method, like
+  // TxnProcessor::ExecuteTxnParallel.
+  // Note that you can use active_set_ and active_set_mutex_ we provided
+  // for you in the txn_processor.h
+  //
+  // [For now, run serial scheduler in order to make it through the test
+  // suite]
+  RunSerialScheduler();
+}
+
+void TxnProcessor::RunMVCCScheduler() {
+  // CPSC 438/538:
+  //
+  // Implement this method!
+  
+  // Hint:Pop a txn from txn_requests_, and pass it to a thread to execute. 
+  // Note that you may need to create another execute method, like TxnProcessor::MVCCExecuteTxn. 
+  //
+  // [For now, run serial scheduler in order to make it through the test
+  // suite]
+  RunSerialScheduler();
+}
+
 void TxnProcessor::ExecuteTxn(Txn* txn) {
 
   // Get the start time
@@ -252,49 +304,260 @@ void TxnProcessor::ExecuteTxn(Txn* txn) {
   completed_txns_.Push(txn);
 }
 
-void TxnProcessor::ApplyWrites(Txn* txn) {
+
+
+
+
+
+
+
+
+
+
+
+
+
+// SILO IMPLEMENTATION
+
+void TxnProcessor::RunOCCScheduler() {
+  Txn *txn;
+
+  std::cout << "Running OCC Scheduler";
+
+  // Start epoch thread
+  tp_.RunTask(new Method<TxnProcessor, void>(
+        this,
+        &TxnProcessor::EpochManager));
+
+  std::cout << "Started Epoch Thread";
+
+  // Start worker threads
+  while (tp_.Active()) {
+    if (txn_requests_.Pop(&txn)) {
+      ++requests_in_system;
+      tp_.RunTask(new Method<TxnProcessor, void, Txn*>(
+        this,
+        &TxnProcessor::RunSiloThread,
+        txn));
+    }
+  }
+}
+
+
+void TxnProcessor::RunSiloThread(Txn* txn) {
+
+  // @debug
+  std::cout << "thread " << std::this_thread::get_id() << ": " << std::flush;
+  printf("In RunSiloThread()");
+
+  thread_local static uint64 workerMaxTid;
+  thread_local static uint64 e;
+  uint64 maxSeenTid = 0;
+
+
+  // Read everything in from readset.
+  for (set<Key>::iterator it = txn->readset_.begin();
+       it != txn->readset_.end(); ++it) {
+    // Save each read result iff record exists in storage.
+    Value result;
+    if (storage_->Read(*it, &result)) {
+      txn->reads_[*it] = result;
+      maxSeenTid = (result.tid > maxSeenTid) ? result.tid : maxSeenTid;
+    }
+  }
+
+  // @debug
+  std::cout << "thread " << std::this_thread::get_id() << ": " << std::flush;
+  printf("Readset has been read\n");
+
+  // Also read everything in from writeset.
+  for (set<Key>::iterator it = txn->writeset_.begin();
+       it != txn->writeset_.end(); ++it) {
+    // Save each read result iff record exists in storage.
+    Value result;
+    if (storage_->Read(*it, &result)) {
+      txn->writes_[*it] = result;
+      maxSeenTid = (result.tid > maxSeenTid) ? result.tid : maxSeenTid;
+    }
+  }
+
+  // @debug
+  std::cout << "thread " << std::this_thread::get_id() << ": " << std::flush;
+  printf("Writeset has been read\n");
+
+
+  // Execute txn's program logic.
+  txn->Run();
+
+  // Commit phase 1
+  // Lock every record in writeset (NOTE: sets are ordered by c++)
+
+  // @debug
+  std::cout << "thread " << std::this_thread::get_id() << ": " << std::flush;
+  printf("Begin commit phase 1\n");
+
+  for (set<Key>::iterator it = txn->writeset_.begin(); it != txn->writeset_.end(); ++it) {
+    siloLock(storage_->GetTID(*it));
+  }
+  
+
+  // Read global epoch number (surrounded by compiler fence)
+  uint64 old_e = e;
+
+  barrier();
+  e = E;
+  barrier();
+
+  if (old_e != e) {
+    workerMaxTid = (e << 51);
+  }
+
+  // Commit phase 2
+
+
+  // @debug
+  std::cout << "thread " << std::this_thread::get_id() << ": " << std::flush;
+  printf("Begin commit phase 2\n");
+
+  for (set<Key>::iterator it = txn->readset_.begin(); it != txn->readset_.end(); ++it) {
+    uint64 tid = *(storage_->GetTID(*it));
+
+    // Record locked by another txn
+    if (isLocked(tid) && ((txn->writes_).count(*it) == 0)) {
+      abort(txn);
+    }
+    // TID changed since read
+    else if (unlockTid(tid) != unlockTid((txn->reads_[*it]).tid)) {
+      abort(txn);
+    }
+  }
+
+
+
+  // Commit phase 3
+
+  // @debug
+  std::cout << "thread " << std::this_thread::get_id() << ": " << std::flush;
+  printf("Begin commit phase 3\n");
+  
+  // Build tid
+  uint64 txnTid = (workerMaxTid > maxSeenTid) ? (workerMaxTid + 1) : (maxSeenTid + 1);
+  uint64 txnTidWord = buildTidWord(txnTid, e);
+
+  // Update maxTid of this worker
+  workerMaxTid = txnTid;
+
+
+  // @debug
+  std::cout << "thread " << std::this_thread::get_id() << ": " << std::flush;
+  printf("About to apply writes\n");
+
+  ApplyWrites(txn, txnTidWord);
+  txn->status_ = COMMITTED;
+
+
+  // @debug
+  std::cout << "thread " << std::this_thread::get_id() << ": " << std::flush;
+  printf("Successfully applied writes\n");
+
+  /*
+  std::cout << "thread " << std::this_thread::get_id() << ": " << std::flush;
+  printf("BEFORE completedtxns.Size() = %d\n", completed_txns_.Size());
+  */
+
+  // Queue completed txns to be delivered to client on epoch boundary
+  // completed_txns_.Push(txn);
+  txn_results_.Push(txn);
+  --requests_in_system;
+
+  std::cout << "thread " << std::this_thread::get_id() << ": " << std::flush;
+  printf("requests in system = %d\n", (int)requests_in_system);
+
+/*
+  std::cout << "thread " << std::this_thread::get_id() << ": " << std::flush;
+  printf("AFTER completedtxns.Size() = %d\n", completed_txns_.Size());
+  */
+}
+
+
+
+uint64 TxnProcessor::buildTidWord(uint64 tid, uint64 epoch) {
+  // High order 13 bits reserved for epoch number
+  uint64 result = (epoch << 51);
+
+  // Middle 50 bits reserved for TID, last (lock) bit 0
+  return result | (tid << 1);
+}
+
+
+uint64 TxnProcessor::unlockTid(uint64 tid) {
+  return (tid >> 1) << 1;
+}
+
+
+bool TxnProcessor::isLocked(uint64 tid) {
+  if ((tid & 1) == 0) {
+    return false;
+  }
+  else {
+    return true;
+  }
+}
+
+
+void TxnProcessor::abort(Txn *txn) {
+  txn->status_ = INCOMPLETE;
+  txn->reads_.clear();
+  txn->writes_.clear();
+
+  mutex_.Lock();
+  txn->unique_id_ = next_unique_id_;
+  next_unique_id_++;
+  txn_requests_.Push(txn);
+  mutex_.Unlock();
+} 
+
+
+void TxnProcessor::ApplyWrites(Txn* txn, uint64 tid) {
   // Write buffered writes out to storage.
   for (map<Key, Value>::iterator it = txn->writes_.begin();
        it != txn->writes_.end(); ++it) {
     storage_->Write(it->first, it->second, txn->unique_id_);
+
+    // Perform memory fence then store TID + Release lock
+    barrier();
+    *(storage_->GetTID(it->first)) = tid;
+  }
+
+}
+
+
+void TxnProcessor::EpochManager() {
+  while (true) {
+    sleep(40);
+    ++E;
+
+    /*
+    Txn *txn;
+    while (completed_txns_.Pop(&txn)) {
+      txn_results_.Push(txn);
+    }
+    */
   }
 }
 
-void TxnProcessor::RunOCCScheduler() {
-  // CPSC 438/538:
-  //
-  // Implement this method!
-  //
-  // [For now, run serial scheduler in order to make it through the test
-  // suite]
 
-  RunSerialScheduler();
+// Lock TID word using compare-and-swap instruction in a loop
+inline void TxnProcessor::siloLock(uint64 *tid) {
+  uint64 curVal = *tid;
+  while (!cmp_and_swap(tid, unlockTid(curVal), curVal | 1)) {
+
+    // TODO: take this nonsense out
+    printf("BAD BOY, NO PAUSING");
+    exit(1);
+    
+    do_pause();
+    curVal = *tid;
+  }
+
 }
-
-void TxnProcessor::RunOCCParallelScheduler() {
-  // CPSC 438/538:
-  //
-  // Implement this method! Note that implementing OCC with parallel
-  // validation may need to create another method, like
-  // TxnProcessor::ExecuteTxnParallel.
-  // Note that you can use active_set_ and active_set_mutex_ we provided
-  // for you in the txn_processor.h
-  //
-  // [For now, run serial scheduler in order to make it through the test
-  // suite]
-  RunSerialScheduler();
-}
-
-void TxnProcessor::RunMVCCScheduler() {
-  // CPSC 438/538:
-  //
-  // Implement this method!
-  
-  // Hint:Pop a txn from txn_requests_, and pass it to a thread to execute. 
-  // Note that you may need to create another execute method, like TxnProcessor::MVCCExecuteTxn. 
-  //
-  // [For now, run serial scheduler in order to make it through the test
-  // suite]
-  RunSerialScheduler();
-}
-
